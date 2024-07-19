@@ -1,14 +1,3 @@
-# This code is part of Kessler, a machine learning library for spacecraft collision avoidance.
-#
-# Copyright (c) 2020-
-# University of Oxford (Atilim Gunes Baydin <gunes@robots.ox.ac.uk>)
-# Trillium Technologies
-# Giacomo Acciarini
-# and other contributors, see README in root of repository.
-#
-# GNU General Public License version 3. See LICENSE in root of repository.
-
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -154,112 +143,112 @@ class LSTMPredictor(nn.Module):
             plt.savefig(file_name)
 
     def learn(self, event_set, epochs=2, lr=1e-3, batch_size=8, device='cpu', valid_proportion=0.15, num_workers=4, event_samples_for_stats=250, file_name_prefix=None):
-    device = torch.device(device)
-    
-    num_params = sum(p.numel() for p in self.parameters())
-    print('LSTM predictor with params: {:,}'.format(num_params))
-
-    if event_samples_for_stats > len(event_set):
-        event_samples_for_stats = len(event_set)
-
-    if self._features_stats is None:
-        print('Computing normalization statistics')
-        self._features_stats = DatasetEventDataset(event_set[:event_samples_for_stats], self._features)._features_stats
-
-    self.to(device)
-    optimizer = optim.Adam(self.parameters(), lr=lr)
-
-    event_set = event_set.filter(lambda event: len(event) > 1)
-
-    valid_set_size = int(len(event_set) * valid_proportion)
-    if valid_set_size == 0:
-        raise RuntimeError('Validation set size is 0 for the given valid_proportion ({}) and number of events ({})'.format(valid_proportion, len(event_set)))
-    
-    train_set_size = len(event_set) - valid_set_size
-    train_set = DatasetEventDataset(event_set[:train_set_size], self._features, self._features_stats)
-    valid_set = DatasetEventDataset(event_set[train_set_size:], self._features, self._features_stats)
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-
-    if len(self._hist_train_loss_iters) == 0:
-        total_iters = 0
-    else:
-        total_iters = self._hist_train_loss_iters[-1]
-
-    for epoch in range(epochs):
-        start_time = time.time()
+        device = torch.device(device)
         
-        self.eval()
-        total_valid_loss = 0
-        total_valid_correct = 0
-        total_valid_samples = 0
-        with torch.no_grad():
-            for events, event_lengths in valid_loader:
+        num_params = sum(p.numel() for p in self.parameters())
+        print('LSTM predictor with params: {:,}'.format(num_params))
+
+        if event_samples_for_stats > len(event_set):
+            event_samples_for_stats = len(event_set)
+
+        if self._features_stats is None:
+            print('Computing normalization statistics')
+            self._features_stats = DatasetEventDataset(event_set[:event_samples_for_stats], self._features)._features_stats
+
+        self.to(device)
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+
+        event_set = event_set.filter(lambda event: len(event) > 1)
+
+        valid_set_size = int(len(event_set) * valid_proportion)
+        if valid_set_size == 0:
+            raise RuntimeError('Validation set size is 0 for the given valid_proportion ({}) and number of events ({})'.format(valid_proportion, len(event_set)))
+        
+        train_set_size = len(event_set) - valid_set_size
+        train_set = DatasetEventDataset(event_set[:train_set_size], self._features, self._features_stats)
+        valid_set = DatasetEventDataset(event_set[train_set_size:], self._features, self._features_stats)
+
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+
+        if len(self._hist_train_loss_iters) == 0:
+            total_iters = 0
+        else:
+            total_iters = self._hist_train_loss_iters[-1]
+
+        for epoch in range(epochs):
+            start_time = time.time()
+            
+            self.eval()
+            total_valid_loss = 0
+            total_valid_correct = 0
+            total_valid_samples = 0
+            with torch.no_grad():
+                for events, event_lengths in valid_loader:
+                    events, event_lengths = events.to(device), event_lengths.to(device)
+                    batch_size = event_lengths.nelement()
+                    input = events[:, :-1]
+                    target = events[:, 1:]
+                    event_lengths -= 1
+                    self.reset(batch_size)
+                    output = self(input, event_lengths)
+                    loss = nn.functional.mse_loss(output, target)
+                    valid_loss = float(loss)
+                    
+                    total_valid_loss += valid_loss * events.size(0)
+                    _, predicted = torch.max(output, 1)
+                    total_valid_correct += (predicted == target).sum().item()
+                    total_valid_samples += events.size(0)
+                    self._hist_valid_loss_iters.append(total_iters)
+                    self._hist_valid_loss.append(valid_loss)
+
+            avg_valid_loss = total_valid_loss / total_valid_samples
+            avg_valid_accuracy = total_valid_correct / total_valid_samples
+            self._hist_valid_accuracy.append(avg_valid_accuracy)
+
+            self.train()
+            total_train_loss = 0
+            total_train_correct = 0
+            total_train_samples = 0
+
+            for i_minibatch, (events, event_lengths) in enumerate(train_loader):
                 events, event_lengths = events.to(device), event_lengths.to(device)
                 batch_size = event_lengths.nelement()
                 input = events[:, :-1]
                 target = events[:, 1:]
                 event_lengths -= 1
                 self.reset(batch_size)
+                optimizer.zero_grad()
                 output = self(input, event_lengths)
                 loss = nn.functional.mse_loss(output, target)
-                valid_loss = float(loss)
-                
-                total_valid_loss += valid_loss * events.size(0)
+                loss.backward()
+                optimizer.step()
+
+                train_loss = float(loss)
+                total_train_loss += train_loss * events.size(0)
                 _, predicted = torch.max(output, 1)
-                total_valid_correct += (predicted == target).sum().item()
-                total_valid_samples += events.size(0)
-                self._hist_valid_loss_iters.append(total_iters)
-                self._hist_valid_loss.append(valid_loss)
+                total_train_correct += (predicted == target).sum().item()
+                total_train_samples += events.size(0)
 
-        avg_valid_loss = total_valid_loss / total_valid_samples
-        avg_valid_accuracy = total_valid_correct / total_valid_samples
-        self._hist_valid_accuracy.append(avg_valid_accuracy)
+                self._hist_train_loss_iters.append(total_iters)
+                self._hist_train_loss.append(train_loss)
 
-        self.train()
-        total_train_loss = 0
-        total_train_correct = 0
-        total_train_samples = 0
+                total_iters += 1
+                print('iter {} | minibatch {}/{} | epoch {}/{} | train loss {:.4e} | valid loss {:.4e}'.format(total_iters, i_minibatch+1, len(train_loader), epoch+1, epochs, train_loss, valid_loss), end='\r')
+                sys.stdout.flush()
 
-        for i_minibatch, (events, event_lengths) in enumerate(train_loader):
-            events, event_lengths = events.to(device), event_lengths.to(device)
-            batch_size = event_lengths.nelement()
-            input = events[:, :-1]
-            target = events[:, 1:]
-            event_lengths -= 1
-            self.reset(batch_size)
-            optimizer.zero_grad()
-            output = self(input, event_lengths)
-            loss = nn.functional.mse_loss(output, target)
-            loss.backward()
-            optimizer.step()
+            avg_train_loss = total_train_loss / total_train_samples
+            avg_train_accuracy = total_train_correct / total_train_samples
+            self._hist_train_accuracy.append(avg_train_accuracy)
 
-            train_loss = float(loss)
-            total_train_loss += train_loss * events.size(0)
-            _, predicted = torch.max(output, 1)
-            total_train_correct += (predicted == target).sum().item()
-            total_train_samples += events.size(0)
+            epoch_time = time.time() - start_time
+            print(f'Epoch {epoch+1}/{epochs}')
+            print(f'{len(train_loader)}/{len(train_loader)} [==============================] - {epoch_time:.0f}s {epoch_time*1000//len(train_loader):.0f}ms/step - loss: {avg_train_loss:.4f} - accuracy: {avg_train_accuracy:.4f} - val_loss: {avg_valid_loss:.4f} - val_accuracy: {avg_valid_accuracy:.4f}')
 
-            self._hist_train_loss_iters.append(total_iters)
-            self._hist_train_loss.append(train_loss)
-
-            total_iters += 1
-            print('iter {} | minibatch {}/{} | epoch {}/{} | train loss {:.4e} | valid loss {:.4e}'.format(total_iters, i_minibatch+1, len(train_loader), epoch+1, epochs, train_loss, valid_loss), end='\r')
-            sys.stdout.flush()
-
-        avg_train_loss = total_train_loss / total_train_samples
-        avg_train_accuracy = total_train_correct / total_train_samples
-        self._hist_train_accuracy.append(avg_train_accuracy)
-
-        epoch_time = time.time() - start_time
-        print(f'Epoch {epoch+1}/{epochs}')
-        print(f'{len(train_loader)}/{len(train_loader)} [==============================] - {epoch_time:.0f}s {epoch_time*1000//len(train_loader):.0f}ms/step - loss: {avg_train_loss:.4f} - accuracy: {avg_train_accuracy:.4f} - val_loss: {avg_valid_loss:.4f} - val_accuracy: {avg_valid_accuracy:.4f}')
-
-        if file_name_prefix is not None:
-            file_name = file_name_prefix + '_epoch_{}'.format(epoch+1)
-            print('Saving model checkpoint to file {}'.format(file_name))
-            self.save(file_name)
+            if file_name_prefix is not None:
+                file_name = file_name_prefix + '_epoch_{}'.format(epoch+1)
+                print('Saving model checkpoint to file {}'.format(file_name))
+                self.save(file_name)
 
 
     def plot_accuracy(self, file_name=None):
