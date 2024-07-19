@@ -139,6 +139,8 @@ class LSTMPredictor(nn.Module):
         self._hist_train_loss_iters = []
         self._hist_valid_loss = []
         self._hist_valid_loss_iters = []
+        self._hist_train_accuracy = []
+        self._hist_valid_accuracy = []
 
     def plot_loss(self, file_name=None):
         fig, ax = plt.subplots()
@@ -152,179 +154,127 @@ class LSTMPredictor(nn.Module):
             plt.savefig(file_name)
 
     def learn(self, event_set, epochs=2, lr=1e-3, batch_size=8, device='cpu', valid_proportion=0.15, num_workers=4, event_samples_for_stats=250, file_name_prefix=None):
-        if device is None:
-            device = torch.device('cpu')
+    device = torch.device(device)
+    
+    num_params = sum(p.numel() for p in self.parameters())
+    print('LSTM predictor with params: {:,}'.format(num_params))
 
-        num_params = sum(p.numel() for p in self.parameters())
-        print('LSTM predictor with params: {:,}'.format(num_params))
+    if event_samples_for_stats > len(event_set):
+        event_samples_for_stats = len(event_set)
 
-        if event_samples_for_stats > len(event_set):
-            event_samples_for_stats = len(event_set)
+    if self._features_stats is None:
+        print('Computing normalization statistics')
+        self._features_stats = DatasetEventDataset(event_set[:event_samples_for_stats], self._features)._features_stats
 
-        if self._features_stats is None:
-            print('Computing normalization statistics')
-            self._features_stats = DatasetEventDataset(event_set[:event_samples_for_stats], self._features)._features_stats
+    self.to(device)
+    optimizer = optim.Adam(self.parameters(), lr=lr)
 
-        self.to(device)
-        optimizer = optim.Adam(self.parameters(), lr=lr)
+    event_set = event_set.filter(lambda event: len(event) > 1)
 
-        event_set = event_set.filter(lambda event: len(event) > 1)
+    valid_set_size = int(len(event_set) * valid_proportion)
+    if valid_set_size == 0:
+        raise RuntimeError('Validation set size is 0 for the given valid_proportion ({}) and number of events ({})'.format(valid_proportion, len(event_set)))
+    
+    train_set_size = len(event_set) - valid_set_size
+    train_set = DatasetEventDataset(event_set[:train_set_size], self._features, self._features_stats)
+    valid_set = DatasetEventDataset(event_set[train_set_size:], self._features, self._features_stats)
 
-        valid_set_size = int(len(event_set) * valid_proportion)
-        if valid_set_size == 0:
-            raise RuntimeError('Validation set size is 0 for the given valid_proportion ({}) and number of events ({})'.format(valid_proportion, len(event_set)))
-        train_set_size = len(event_set) - valid_set_size
-        train_set = DatasetEventDataset(event_set[:train_set_size], self._features, self._features_stats)
-        valid_set = DatasetEventDataset(event_set[train_set_size:], self._features, self._features_stats)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
 
-        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-        valid_loader = DataLoader(valid_set, batch_size=len(valid_set), shuffle=True, num_workers=num_workers)
-        self.train()
-        if len(self._hist_train_loss_iters) == 0:
-            total_iters = 0
-        else:
-            total_iters = self._hist_train_loss_iters[-1]
-        for epoch in range(epochs):
-            with torch.no_grad():
-                for _, (events, event_lengths) in enumerate(valid_loader):
-                    events, event_lengths = events.to(device), event_lengths.to(device)
-                    batch_size = event_lengths.nelement()  # Can be smaller than batch_size for the last minibatch of an epoch
-                    input = events[:, :-1]
-                    target = events[:, 1:]
-                    event_lengths -= 1
-                    self.reset(batch_size)
-                    output = self(input, event_lengths)
-                    loss = nn.functional.mse_loss(output, target)
-                    valid_loss = float(loss)
-                    self._hist_valid_loss_iters.append(total_iters)
-                    self._hist_valid_loss.append(valid_loss)
-                    start_time = time.time()
-                    val_loss, val_accuracy = self.validate()
-                    self.val_losses.append(val_loss)
-                    self.val_accuracies.append(val_accuracy)
+    if len(self._hist_train_loss_iters) == 0:
+        total_iters = 0
+    else:
+        total_iters = self._hist_train_loss_iters[-1]
 
-            for i_minibatch, (events, event_lengths) in enumerate(train_loader):
-                total_iters += 1
+    for epoch in range(epochs):
+        start_time = time.time()
+        
+        self.eval()
+        total_valid_loss = 0
+        total_valid_correct = 0
+        total_valid_samples = 0
+        with torch.no_grad():
+            for events, event_lengths in valid_loader:
                 events, event_lengths = events.to(device), event_lengths.to(device)
-                batch_size = event_lengths.nelement()  # Can be smaller than batch_size for the last minibatch of an epoch
+                batch_size = event_lengths.nelement()
                 input = events[:, :-1]
                 target = events[:, 1:]
                 event_lengths -= 1
                 self.reset(batch_size)
-                optimizer.zero_grad()
                 output = self(input, event_lengths)
                 loss = nn.functional.mse_loss(output, target)
-                loss.backward()
-                optimizer.step()
+                valid_loss = float(loss)
+                
+                total_valid_loss += valid_loss * events.size(0)
+                _, predicted = torch.max(output, 1)
+                total_valid_correct += (predicted == target).sum().item()
+                total_valid_samples += events.size(0)
+                self._hist_valid_loss_iters.append(total_iters)
+                self._hist_valid_loss.append(valid_loss)
 
-                train_loss = float(loss)
-                self._hist_train_loss_iters.append(total_iters)
-                self._hist_train_loss.append(train_loss)
-                train_loss, train_accuracy = self.train_one_epoch()
-                end_time = time.time()
-                self.train_losses.append(train_loss)
-                self.train_accuracies.append(train_accuracy)
-                epoch_time = end_time - start_time
-                print(f'Epoch {epoch+1}/{epochs}')
-                print(f'{len(self.train_dataset)//self.batch_size}/{len(self.train_dataset)//self.batch_size} [==============================] - {epoch_time:.0f}s {epoch_time*1000//len(self.train_dataset):.0f}ms/step - loss: {train_loss:.4f} - accuracy: {train_accuracy:.4f} - val_loss: {val_loss:.4f} - val_accuracy: {val_accuracy:.4f}')
+        avg_valid_loss = total_valid_loss / total_valid_samples
+        avg_valid_accuracy = total_valid_correct / total_valid_samples
+        self._hist_valid_accuracy.append(avg_valid_accuracy)
 
-                print('iter {} | minibatch {}/{} | epoch {}/{} | train loss {:.4e} | valid loss {:.4e}  '.format(total_iters, i_minibatch+1, len(train_loader), epoch+1, epochs, train_loss, valid_loss), end='\r')
-                sys.stdout.flush()
+        self.train()
+        total_train_loss = 0
+        total_train_correct = 0
+        total_train_samples = 0
 
-            if file_name_prefix is not None:
-                file_name = file_name_prefix + '_epoch_{}'.format(epoch+1)
-                print('Saving model checkpoint to file {}'.format(file_name))
-                self.save(file_name)
-
-    def validate(self):
-        self.model.eval()  # Set the model to evaluation mode
-        total_loss = 0
-        total_correct = 0
-        total_samples = 0
-
-        # Assuming you have defined DataLoader for your validation data
-        val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-        criterion = nn.CrossEntropyLoss()  # Or another loss function appropriate for your task
-
-        with torch.no_grad():
-            for batch in val_loader:
-                inputs, targets = batch
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-
-                outputs = self.model(inputs)
-                loss = criterion(outputs, targets)
-
-                total_loss += loss.item() * inputs.size(0)
-                _, predicted = torch.max(outputs, 1)
-                total_correct += (predicted == targets).sum().item()
-                total_samples += inputs.size(0)
-
-        val_loss = total_loss / total_samples
-        val_accuracy = total_correct / total_samples
-
-        return val_loss, val_accuracy
-
-
-
-    def train_one_epoch(self):
-        self.model.train()  # Set the model to training mode
-        total_loss = 0
-        total_correct = 0
-        total_samples = 0
-        
-        # Assuming you have defined DataLoader for your training data
-        train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
-        optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        criterion = nn.CrossEntropyLoss()  # Or another loss function appropriate for your task
-
-        for batch in train_loader:
-            inputs, targets = batch
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-
+        for i_minibatch, (events, event_lengths) in enumerate(train_loader):
+            events, event_lengths = events.to(device), event_lengths.to(device)
+            batch_size = event_lengths.nelement()
+            input = events[:, :-1]
+            target = events[:, 1:]
+            event_lengths -= 1
+            self.reset(batch_size)
             optimizer.zero_grad()
-            outputs = self.model(inputs)
-            loss = criterion(outputs, targets)
+            output = self(input, event_lengths)
+            loss = nn.functional.mse_loss(output, target)
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs, 1)
-            total_correct += (predicted == targets).sum().item()
-            total_samples += inputs.size(0)
+            train_loss = float(loss)
+            total_train_loss += train_loss * events.size(0)
+            _, predicted = torch.max(output, 1)
+            total_train_correct += (predicted == target).sum().item()
+            total_train_samples += events.size(0)
 
-        train_loss = total_loss / total_samples
-        train_accuracy = total_correct / total_samples
+            self._hist_train_loss_iters.append(total_iters)
+            self._hist_train_loss.append(train_loss)
 
-        return train_loss, train_accuracy
-        
-    
-    def plot_metrics(self):
-        import matplotlib.pyplot as plt
+            total_iters += 1
+            print('iter {} | minibatch {}/{} | epoch {}/{} | train loss {:.4e} | valid loss {:.4e}'.format(total_iters, i_minibatch+1, len(train_loader), epoch+1, epochs, train_loss, valid_loss), end='\r')
+            sys.stdout.flush()
 
-        epochs = range(1, len(self.train_losses) + 1)
+        avg_train_loss = total_train_loss / total_train_samples
+        avg_train_accuracy = total_train_correct / total_train_samples
+        self._hist_train_accuracy.append(avg_train_accuracy)
 
-        plt.figure(figsize=(12, 5))
+        epoch_time = time.time() - start_time
+        print(f'Epoch {epoch+1}/{epochs}')
+        print(f'{len(train_loader)}/{len(train_loader)} [==============================] - {epoch_time:.0f}s {epoch_time*1000//len(train_loader):.0f}ms/step - loss: {avg_train_loss:.4f} - accuracy: {avg_train_accuracy:.4f} - val_loss: {avg_valid_loss:.4f} - val_accuracy: {avg_valid_accuracy:.4f}')
 
-        # Plot loss
-        plt.subplot(1, 2, 1)
-        plt.plot(epochs, self.train_losses, 'b', label='Training loss')
-        plt.plot(epochs, self.val_losses, 'r', label='Validation loss')
-        plt.title('Training and Validation loss')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plt.legend()
+        if file_name_prefix is not None:
+            file_name = file_name_prefix + '_epoch_{}'.format(epoch+1)
+            print('Saving model checkpoint to file {}'.format(file_name))
+            self.save(file_name)
 
-        # Plot accuracy
-        plt.subplot(1, 2, 2)
-        plt.plot(epochs, self.train_accuracies, 'b', label='Training accuracy')
-        plt.plot(epochs, self.val_accuracies, 'r', label='Validation accuracy')
-        plt.title('Training and Validation accuracy')
-        plt.xlabel('Epochs')
-        plt.ylabel('Accuracy')
-        plt.legend()
 
-        plt.tight_layout()
+    def plot_accuracy(self, file_name=None):
+        fig, ax = plt.subplots()
+        ax.plot(range(1, len(self._hist_train_accuracy) + 1), self._hist_train_accuracy, label='Training')
+        ax.plot(range(1, len(self._hist_valid_accuracy) + 1), self._hist_valid_accuracy, label='Validation')
+        ax.set_xlabel('Epochs')
+        ax.set_ylabel('Accuracy')
+        ax.legend()
+        if file_name is not None:
+            print('Plotting to file: {}'.format(file_name))
+            plt.savefig(file_name)
         plt.show()
+    
+
 
     def predict(self, event):
         ds = DatasetEventDataset(EventDataset(events=[event]), features=self._features, features_stats=self._features_stats)
