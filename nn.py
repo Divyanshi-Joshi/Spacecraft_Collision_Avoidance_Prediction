@@ -274,8 +274,8 @@ class LSTMPredictor(nn.Module):
                 self.save(file_name)
 
      def calculate_accuracy(self, output, target):
-        correct = torch.abs(output - target) < 0.1  
-        return correct.float().mean().item()
+         correct = torch.abs(output - target) < 0.1  
+         return correct.float().mean().item()
         
 
     def predict(self, event):
