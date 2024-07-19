@@ -4,8 +4,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import sys
-from tqdm import tqdm
-import time
+
 from . import util
 from .cdm import ConjunctionDataMessage
 from .event import EventDataset
@@ -128,8 +127,9 @@ class LSTMPredictor(nn.Module):
         self._hist_train_loss_iters = []
         self._hist_valid_loss = []
         self._hist_valid_loss_iters = []
-        self._hist_train_accuracy = []
-        self._hist_valid_accuracy = []
+        self._hist_train_acc = []
+        self._hist_valid_acc = []
+        self._hist_epochs = []
 
     def plot_loss(self, file_name=None):
         fig, ax = plt.subplots()
@@ -142,9 +142,33 @@ class LSTMPredictor(nn.Module):
             print('Plotting to file: {}'.format(file_name))
             plt.savefig(file_name)
 
-    def learn(self, event_set, epochs=2, lr=1e-3, batch_size=8, device='cpu', valid_proportion=0.15, num_workers=4, event_samples_for_stats=250, file_name_prefix=None):
-        device = torch.device(device)
+    
+    def plot_accuracy(self, file_name=None):
+        fig, ax = plt.subplots()
+        ax.plot(self._hist_epochs, self._hist_train_acc, label='Training')
+        ax.plot(self._hist_epochs, self._hist_valid_acc, label='Validation')
+        ax.set_xlabel('Epochs')
+        ax.set_ylabel('Accuracy')
+        ax.legend()
+        if file_name is not None:
+            print('Plotting accuracy to file: {}'.format(file_name))
+            plt.savefig(file_name)
         
+    def plot_loss_vs_epochs(self, file_name=None):
+        fig, ax = plt.subplots()
+        ax.plot(self._hist_epochs, self._hist_train_loss, label='Training')
+        ax.plot(self._hist_epochs, self._hist_valid_loss, label='Validation')
+        ax.set_xlabel('Epochs')
+        ax.set_ylabel('Loss')
+        ax.legend()
+        if file_name is not None:
+            print('Plotting loss vs epochs to file: {}'.format(file_name))
+            plt.savefig(file_name)
+
+    def learn(self, event_set, epochs=2, lr=1e-3, batch_size=8, device='cpu', valid_proportion=0.15, num_workers=4, event_samples_for_stats=250, file_name_prefix=None):
+        if device is None:
+            device = torch.device('cpu')
+
         num_params = sum(p.numel() for p in self.parameters())
         print('LSTM predictor with params: {:,}'.format(num_params))
 
@@ -163,30 +187,32 @@ class LSTMPredictor(nn.Module):
         valid_set_size = int(len(event_set) * valid_proportion)
         if valid_set_size == 0:
             raise RuntimeError('Validation set size is 0 for the given valid_proportion ({}) and number of events ({})'.format(valid_proportion, len(event_set)))
-        
         train_set_size = len(event_set) - valid_set_size
         train_set = DatasetEventDataset(event_set[:train_set_size], self._features, self._features_stats)
         valid_set = DatasetEventDataset(event_set[train_set_size:], self._features, self._features_stats)
 
         train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-        valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-
+        valid_loader = DataLoader(valid_set, batch_size=len(valid_set), shuffle=True, num_workers=num_workers)
+        self.train()
         if len(self._hist_train_loss_iters) == 0:
             total_iters = 0
         else:
             total_iters = self._hist_train_loss_iters[-1]
 
+        
+                    
         for epoch in range(epochs):
-            start_time = time.time()
-            
+            epoch_train_loss = 0
+            epoch_train_acc = 0
+            epoch_valid_loss = 0
+            epoch_valid_acc = 0
+            train_batches = 0
+            valid_batches = 0
             self.eval()
-            total_valid_loss = 0
-            total_valid_correct = 0
-            total_valid_samples = 0
             with torch.no_grad():
-                for events, event_lengths in valid_loader:
+                for _, (events, event_lengths) in enumerate(valid_loader):
                     events, event_lengths = events.to(device), event_lengths.to(device)
-                    batch_size = event_lengths.nelement()
+                    batch_size = event_lengths.nelement()  # Can be smaller than batch_size for the last minibatch of an epoch
                     input = events[:, :-1]
                     target = events[:, 1:]
                     event_lengths -= 1
@@ -194,26 +220,19 @@ class LSTMPredictor(nn.Module):
                     output = self(input, event_lengths)
                     loss = nn.functional.mse_loss(output, target)
                     valid_loss = float(loss)
-                    
-                    total_valid_loss += valid_loss * events.size(0)
-                    _, predicted = torch.max(output, 1)
-                    total_valid_correct += (predicted == target).sum().item()
-                    total_valid_samples += events.size(0)
+                    epoch_valid_loss += float(loss)
+                    accuracy = self.calculate_accuracy(output, target)
+                    epoch_valid_acc += accuracy
+                    valid_batches += 1
                     self._hist_valid_loss_iters.append(total_iters)
                     self._hist_valid_loss.append(valid_loss)
-
-            avg_valid_loss = total_valid_loss / total_valid_samples
-            avg_valid_accuracy = total_valid_correct / total_valid_samples
-            self._hist_valid_accuracy.append(avg_valid_accuracy)
+                    
 
             self.train()
-            total_train_loss = 0
-            total_train_correct = 0
-            total_train_samples = 0
-
             for i_minibatch, (events, event_lengths) in enumerate(train_loader):
+                total_iters += 1
                 events, event_lengths = events.to(device), event_lengths.to(device)
-                batch_size = event_lengths.nelement()
+                batch_size = event_lengths.nelement()  # Can be smaller than batch_size for the last minibatch of an epoch
                 input = events[:, :-1]
                 target = events[:, 1:]
                 event_lengths -= 1
@@ -225,45 +244,39 @@ class LSTMPredictor(nn.Module):
                 optimizer.step()
 
                 train_loss = float(loss)
-                total_train_loss += train_loss * events.size(0)
-                _, predicted = torch.max(output, 1)
-                total_train_correct += (predicted == target).sum().item()
-                total_train_samples += events.size(0)
-
+                epoch_train_loss += float(loss)
+                accuracy = self.calculate_accuracy(output, target)
+                epoch_train_acc += accuracy
+                train_batches += 1
                 self._hist_train_loss_iters.append(total_iters)
                 self._hist_train_loss.append(train_loss)
 
-                total_iters += 1
-                print('iter {} | minibatch {}/{} | epoch {}/{} | train loss {:.4e} | valid loss {:.4e}'.format(total_iters, i_minibatch+1, len(train_loader), epoch+1, epochs, train_loss, valid_loss), end='\r')
+                print('iter {} | minibatch {}/{} | epoch {}/{} | train loss {:.4e} | valid loss {:.4e}  '.format(total_iters, i_minibatch+1, len(train_loader), epoch+1, epochs, train_loss, valid_loss), end='\r')
                 sys.stdout.flush()
+                
+            avg_train_loss = epoch_train_loss / train_batches
+            avg_train_acc = epoch_train_acc / train_batches
+            avg_valid_loss = epoch_valid_loss / valid_batches
+            avg_valid_acc = epoch_valid_acc / valid_batches
+            self._hist_train_loss.append(avg_train_loss)
+            self._hist_valid_loss.append(avg_valid_loss)
+            self._hist_train_acc.append(avg_train_acc)
+            self._hist_valid_acc.append(avg_valid_acc)
+            self._hist_epochs.append(epoch + 1)
 
-            avg_train_loss = total_train_loss / total_train_samples
-            avg_train_accuracy = total_train_correct / total_train_samples
-            self._hist_train_accuracy.append(avg_train_accuracy)
-
-            epoch_time = time.time() - start_time
-            print(f'Epoch {epoch+1}/{epochs}')
-            print(f'{len(train_loader)}/{len(train_loader)} [==============================] - {epoch_time:.0f}s {epoch_time*1000//len(train_loader):.0f}ms/step - loss: {avg_train_loss:.4f} - accuracy: {avg_train_accuracy:.4f} - val_loss: {avg_valid_loss:.4f} - val_accuracy: {avg_valid_accuracy:.4f}')
+            print(f'\nEpoch {epoch+1}/{epochs} - '
+                  f'Train Loss: {avg_train_loss:.4e}, Train Acc: {avg_train_acc:.4f}, '
+                  f'Valid Loss: {avg_valid_loss:.4e}, Valid Acc: {avg_valid_acc:.4f}')
 
             if file_name_prefix is not None:
                 file_name = file_name_prefix + '_epoch_{}'.format(epoch+1)
                 print('Saving model checkpoint to file {}'.format(file_name))
                 self.save(file_name)
 
-
-    def plot_accuracy(self, file_name=None):
-        fig, ax = plt.subplots()
-        ax.plot(range(1, len(self._hist_train_accuracy) + 1), self._hist_train_accuracy, label='Training')
-        ax.plot(range(1, len(self._hist_valid_accuracy) + 1), self._hist_valid_accuracy, label='Validation')
-        ax.set_xlabel('Epochs')
-        ax.set_ylabel('Accuracy')
-        ax.legend()
-        if file_name is not None:
-            print('Plotting to file: {}'.format(file_name))
-            plt.savefig(file_name)
-        plt.show()
-    
-
+     def calculate_accuracy(self, output, target):
+        correct = torch.abs(output - target) < 0.1  
+        return correct.float().mean().item()
+        
 
     def predict(self, event):
         ds = DatasetEventDataset(EventDataset(events=[event]), features=self._features, features_stats=self._features_stats)
@@ -331,31 +344,3 @@ class LSTMPredictor(nn.Module):
             return es[0]
         else:
             return EventDataset(events=es)
-
-    def save(self, file_name):
-        print('Saving LSTM predictor to file: {}'.format(file_name))
-        torch.save(self, file_name)
-
-    @staticmethod
-    def load(file_name):
-        print('Loading LSTM predictor from file: {}'.format(file_name))
-        return torch.load(file_name)
-
-    def reset(self, batch_size):
-        h = torch.zeros(self.lstm_depth, batch_size, self.lstm_size)
-        c = torch.zeros(self.lstm_depth, batch_size, self.lstm_size)
-        device = list(self.parameters())[0].device
-        h = h.to(device)
-        c = c.to(device)
-        self.hidden = (h, c)
-
-    def forward(self, x, x_lengths):
-        batch_size, x_length_max, _ = x.size()
-        x = torch.nn.utils.rnn.pack_padded_sequence(x, x_lengths, batch_first=True, enforce_sorted=False)
-        x, self.hidden = self.lstm(x, self.hidden)
-        x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True, total_length=x_length_max)
-        if self.dropout:
-            x = self.dropout1(x)
-        x = torch.relu(x)
-        x = self.fc1(x)
-        return x
