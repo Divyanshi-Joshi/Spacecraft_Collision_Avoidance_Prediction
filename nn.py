@@ -344,3 +344,31 @@ class LSTMPredictor(nn.Module):
             return es[0]
         else:
             return EventDataset(events=es)
+            
+    def save(self, file_name):
+        print('Saving LSTM predictor to file: {}'.format(file_name))
+        torch.save(self, file_name)
+
+    @staticmethod
+    def load(file_name):
+        print('Loading LSTM predictor from file: {}'.format(file_name))
+        return torch.load(file_name)
+
+    def reset(self, batch_size):
+        h = torch.zeros(self.lstm_depth, batch_size, self.lstm_size)
+        c = torch.zeros(self.lstm_depth, batch_size, self.lstm_size)
+        device = list(self.parameters())[0].device
+        h = h.to(device)
+        c = c.to(device)
+        self.hidden = (h, c)
+
+    def forward(self, x, x_lengths):
+        batch_size, x_length_max, _ = x.size()
+        x = torch.nn.utils.rnn.pack_padded_sequence(x, x_lengths, batch_first=True, enforce_sorted=False)
+        x, self.hidden = self.lstm(x, self.hidden)
+        x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True, total_length=x_length_max)
+        if self.dropout:
+            x = self.dropout1(x)
+        x = torch.relu(x)
+        x = self.fc1(x)
+        return x
